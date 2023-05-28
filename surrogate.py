@@ -1,0 +1,272 @@
+import ember
+import torch as th
+import numpy as np
+from sklearn.utils import shuffle
+from sklearn.metrics import accuracy_score, hamming_loss, confusion_matrix, recall_score, precision_score, roc_auc_score, roc_curve
+
+import lightgbm as lgb
+import os 
+
+import logging
+logger = logging.getLogger(__name__)
+
+import shap
+from sorel_net import SorelFFNN
+
+def get_target_predictions(target, target_model, X_test):
+
+    # if target = 'SorelFFNN':
+    X_test = np.array(X_test)
+    y_proba = target_model.predict(X_test)
+
+    if target == 'ember':    
+        thresh = 0.8336
+    else:
+        thresh = 0.5
+
+    y_pred = np.where(y_proba>thresh, 1, 0)
+
+    # y_pred = [int(i > thresh) for i in y_proba]
+
+    return y_pred
+
+
+def get_ember_data(data_dir, seed=42):
+    emberdf = ember.read_metadata(data_dir)
+    X_train, y_train, X_test, y_test = ember.read_vectorized_features(data_dir)
+
+    # Get the labels of the "unlabeled" data using the avclass column
+    # This is only required for the dual input DNN but is done for all models
+    # for reasons of uniformity.
+    idx_unlab_mal = emberdf.query("label==-1")["avclass"].dropna().index
+    idx_unlab_ben = emberdf[emberdf.avclass.isnull()].query("label == -1").index
+
+    # Read the data and select the unlabeled instances
+    X_train_mal = X_train[idx_unlab_mal]
+    X_train_ben = X_train[idx_unlab_ben]
+
+    y_train_ben = np.zeros(X_train_ben.shape[0])
+    y_train_mal = np.ones(X_train_mal.shape[0])
+
+    # Create the training dataset
+    y_train = np.concatenate((y_train_ben, y_train_mal))
+    X_train = np.vstack((X_train_ben, X_train_mal))
+
+    X_train_unlab, y_train_unlab = shuffle(X_train, y_train, random_state=seed)
+
+    return X_train_unlab, X_test, y_train_unlab, y_test
+
+
+def get_sorel_data(data_dir, seed=42):
+
+    ndim = 2381
+    X_train_path = os.path.join(data_dir, "X_val.dat")
+    y_train_path = os.path.join(data_dir, "y_val.dat")
+    y_train = np.memmap(y_train_path, dtype=np.float32, mode="r")
+    N = y_train.shape[0]
+    X_train = np.memmap(X_train_path, dtype=np.float32, mode="r", shape=(N, ndim))
+
+    X_test_path = os.path.join(data_dir, "X_test.dat")
+    y_test_path = os.path.join(data_dir, "y_test.dat")
+    y_test = np.memmap(y_test_path, dtype=np.float32, mode="r")
+    N = y_test.shape[0]
+    X_test = np.memmap(X_test_path, dtype=np.float32, mode="r", shape=(N, ndim))
+
+    X_train, y_train = shuffle(X_train, y_train, random_state=seed)
+    
+    return X_train, X_test, y_train, y_test
+
+
+def train_surrogate(target, data_path, save_model_path, seed):
+
+    # Latest data
+    logging.debug(f"Training surrogate model for target {target}.")
+    X_rl = np.load(os.path.join(data_path, 'observations.npy')).reshape(-1, 2381)
+    y_rl = np.load(os.path.join(data_path, 'scores.npy'))
+    logging.debug(f"Shape of rl data: {X_rl.shape}, {y_rl.shape}")
+
+    # If we have prior observations append them here
+    if os.path.exists(os.path.join(save_model_path, 'observations.npy')):
+        X_old = np.load(os.path.join(save_model_path, 'observations.npy'))
+        y_old = np.load(os.path.join(save_model_path, 'scores.npy'))
+
+        X_rl = np.vstack((X_old, X_rl))
+        y_rl = np.concatenate((y_old, y_rl))
+
+    # Store data after merging
+    np.save(os.path.join(save_model_path, 'observations.npy'), X_rl)
+    np.save(os.path.join(save_model_path, 'scores.npy'), y_rl)
+    logging.debug(f"Size of the RL data: {X_rl.shape[0]}")
+
+    if target == 'ember':
+        logging.debug(f"Loading ember data and model")
+        X_train, X_test, y_train, y_test = get_ember_data('/data/mari/ember2018')
+        target_model = lgb.Booster(model_file=os.path.join(save_model_path, 'ember_model.txt'))
+        target_model.params["objective"] = 'binary'
+        num_boosting_rounds = 200
+    elif target == 'sorel':
+        logging.debug(f"Load sorel data and model")
+        X_train, X_test, y_train, y_test = get_sorel_data('/data/mari/sorel-data')
+        target_model = lgb.Booster(model_file=os.path.join(save_model_path, 'sorel.model'))
+        target_model.params["objective"] = 'binary'
+        num_boosting_rounds = 648
+    elif target == 'SorelFFNN':
+        logging.debug(f"Load sorel data and model")
+        X_train, X_test, y_train, y_test = get_sorel_data('/data/mari/sorel-data')
+        target_model = SorelFFNN(model_file='malware_rl/envs/utils/sorelFFNN.pt')
+        num_boosting_rounds = 584 
+    else:
+        logging.debug(f"Loading ember data and model")
+        X_train, X_test, y_train, y_test = get_ember_data('/data/mari/ember2018')
+        num_boosting_rounds = 500
+        # target_model = 
+
+    t = X_rl.shape[0]
+    m = X_train.shape[0]
+
+    logging.debug(f"Size of the training data: {m}")
+    logging.debug(f"Size of the RL data: {t}")
+
+    # w_rl = np.ones(t) * (m/t)
+    alpha = 6.668076
+    w_rl = np.ones(t) * alpha
+    w_train = np.ones(m)
+
+    X = np.vstack((X_train, X_rl))
+    y = np.concatenate((y_train, y_rl))
+    w = np.concatenate((w_train, w_rl))
+
+    """
+    Sorel-LGB
+    alpha 6.66807637739059
+    feature_fraction 0.44946789036102647
+    learning_rate 0.022555062464473086
+    max_depth 12
+    min_child_samples 61
+    num_boosting_rounds 648
+    num_leaves 1175
+    """
+
+    lgb_params = {
+            "boosting_type" : "gbdt",
+            "objective" : "binary",
+            "learning_rate" : 0.0226,
+            "num_leaves": 1175,
+            "max_depth" : 12,
+            "min_child_samples": 61,
+            "feature_fraction": 0.4495,
+            "verbose": -1,
+            "seed": seed
+        }
+    
+    train_data = lgb.Dataset(X, label=y, weight=w)
+
+    model = lgb.train(lgb_params, train_data,
+            num_boost_round=num_boosting_rounds
+        ) 
+
+    y_proba = model.predict(X_test)
+    if target != 'AV1':
+        y_pred_target = get_target_predictions(target, target_model, X_test)
+    else:
+        y_pred_target = None
+
+    if target == 'ember':
+        fpr_target = 0.01
+    elif target == 'sorel':
+        fpr_target = 0.002
+    elif target == 'sorelFFNN':
+        fpr_target = 0.006
+    else:
+        fpr_target = 0.01
+
+    threshold = evaluate_surrogate(y_proba, y_pred_target, y_test, fpr_target)
+
+    if target in ['sorel', 'ember']:
+        exp10, exp20 = eval_explainability(model, target_model, X_test)
+        logging.info(f"Feature explainability: top10={exp10/10}, top20={exp20/20}")
+    
+    model.save_model(os.path.join(save_model_path, f'lgb_{target}_model_{seed}.txt'))
+
+    return threshold
+
+
+def get_fpr(y_true, y_pred):
+    """
+        Given the true and predicted labels calculate the FPR.
+        Uses the confusion_matrix() from scikit-learn.
+    """
+    tn, fp, _, _ = confusion_matrix(y_true, y_pred).ravel()
+    fpr = fp / (tn + fp)
+    return fpr
+
+
+def find_threshold(y_true, y_pred, fpr_target):
+    """
+    Given the true labels and the probabilities of the model
+    calculate the decision threshold for a given FPR level.
+    """
+    fpr, _, thresh = roc_curve(y_true, y_pred)
+    return np.interp(fpr_target, fpr, thresh)
+
+
+def evaluate_surrogate(y_proba, y_pred_target, y_test, fpr_target):
+    thresh = find_threshold(y_test, y_proba, fpr_target)
+
+    # if thresh < 0.5:
+    #     thresh = 0.5
+
+    # y_pred = [int(i > thresh) for i in y_proba]
+    y_pred = np.where(y_proba > thresh, 1, 0)
+
+
+    test_score = accuracy_score(y_test, y_pred)
+    if y_pred_target is None:
+        agg_score = None
+    else:
+        agg_score = 1.0 - hamming_loss(y_pred_target, y_pred)
+
+    fpr_score = get_fpr(y_test, y_pred)
+    rec_score = recall_score(y_test, y_pred)
+    pres_score = precision_score(y_test, y_pred)
+    auc_score = roc_auc_score(y_test, y_pred)
+    conf_mat = confusion_matrix(y_test, y_pred)
+
+    logging.info(f"Threshold for target FPR {fpr_target}: {thresh}")
+    logging.info(f"Accuracy score: {test_score}")
+    logging.info(f"Agreement: {agg_score}")
+    logging.info(f"FPR: {fpr_score}")
+    logging.info(f"Recall: {rec_score}")
+    logging.info(f"Precision: {pres_score}")
+    logging.info(f"AUC: {auc_score}")
+    logging.info(f"Confusion matrix: {conf_mat}")
+
+    return thresh
+
+def eval_explainability(model, target_model, X_test, num_test_samples=2000):
+
+    idx = np.random.choice(np.arange(X_test.shape[0]), num_test_samples)
+
+    surr_ind = get_shapley_indices(model, X_test[idx], 20)
+    target_ind = get_shapley_indices(target_model, X_test[idx], 20)
+
+    exp10 = find_num_common_elements(surr_ind[:10], target_ind[:10])
+    exp20 = find_num_common_elements(surr_ind, target_ind)
+
+    return exp10, exp20
+
+def find_num_common_elements(a, b):
+    return len(np.intersect1d(a, b))
+
+def get_shapley_indices(model, X_test, k):
+    
+    try:
+        explainer = shap.TreeExplainer(model)
+    except:
+        explainer = shap.KernelExplainer(model, data=X_test)
+
+    shap_values = explainer.shap_values(X_test)[0]
+    sort_inds = np.argsort(np.sum(np.abs(shap_values), axis=0))
+
+    return sort_inds[::-1][:k]
+
